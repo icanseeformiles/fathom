@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
+from sklearn import preprocessing
 import matplotlib.pyplot as plt
+from IPython.display import HTML, display
 from keras.models import load_model
 from nutshell import ModelData, Learner, Representation
 
@@ -10,12 +12,15 @@ class FactSet:
 
         self.factset_name = factset_name  # this value informs the names of model files generated
         self.fact_data = pd.DataFrame()   # internal dataset with one row per subject/fact
+        self.fact_alias_data = pd.DataFrame() #
         self.label_data = pd.DataFrame()  # internal dataset with one row per subject
         self.subject_column = ''          # name of subject id column in input dataset
-        self.label_column = ''            # name label column - this will be not be used in training
+        self.label_column = ''            # (optional) name label column - this will be not be used in training
         self.fact_name_column = ''        # name of fact name column in input dataset
         self.fact_value_column = ''       # name of fact value column in input dataset
+        self.fact_alias_column = ''       # name of fact alias column in fact alias dataset
         self.fact_colnames = []           # optional: list of fact columns; default is all non subject/label columns
+        self.fact_alias = {}              # a dictionary of dictionaries: outer is fact name, inner is fact value
         self.model = None
                
     def load_subject_rows(self, df):
@@ -35,6 +40,8 @@ class FactSet:
         self.fact_data['fact_value'] = df[self.fact_value_column]
         
         print(len(df), 'fact rows loaded')
+        
+  
              
 class Fathom:
     
@@ -46,14 +53,15 @@ class Fathom:
         self.subject_data = pd.DataFrame() # data for output for each subject
         self.fact_representation = None    
         self.fact_data = pd.DataFrame() # data for output for each fact
+        self.embedding_factors = 5 # max number of factors in subject and fact embeddings - nutshell default is 50
              
        
-    def load_model(self, model=None, modeldata=None, model_name=''):
+    def load_model(self, p_model=None, modeldata=None, model_name=''):
         
         # load trained model and settings
  
-        if model!=None:
-            self.model = model
+        if p_model!=None:
+            self.model = p_model
             md = modeldata
         else:
             if model_name=='':
@@ -110,7 +118,7 @@ class Fathom:
     
         dfLearn = self.factset_to_df() # convert fact_data to training data format
         
-        data = ModelData(dfLearn)
+        data = ModelData(dfLearn)        
         data.category_columns = ['subject','fact']
         data.label_column = 'is_true'
         data.prepare_data()
@@ -122,6 +130,13 @@ class Fathom:
         print('Building neural network...')
         
         model = Learner(data)
+
+        #adjust embedding size based on configuration setting
+        print('Embedding factors:', self.embedding_factors)
+        #model.output_factors = self.embedding_factors # accuracy is substantially worse by reducing this value
+        for c in model.category_factors.keys():
+            model.category_factors[c] = self.embedding_factors
+        
         model.dropout = .01 # overfitting is the point here - minimize dropout
         model.batch_size = batch_size
         model.build_model()
@@ -132,7 +147,7 @@ class Fathom:
         # early_stopping='loss' is because we are trying to overfit - ignoring validation loss
         
         print ('Stored model to: ', self.factset.factset_name + '_', 'files')
-        load_model(model, data) # set internal model and extract embeddings
+        self.load_model(p_model=model.model, modeldata=data) # set internal model and extract embeddings
         
         
     def generate_xy(self, generate_for='subject'):
@@ -221,17 +236,37 @@ class Fathom:
         dfFactsOut = dfFactsOut.rename(columns={'fact_subjects':'out_fact_subjects', 'set_subjects':'out_subjects', 'fact_perc': 'out_fact_perc'})
         dfFactMetrics = pd.merge(dfFactsIn, dfFactsOut, on=['fact_name', 'fact_value'])
 
+        dfFactMetrics['subject_diff'] = dfFactMetrics.apply(lambda x: x['in_fact_subjects'] - x['out_fact_subjects'], axis=1)
         dfFactMetrics['perc_diff'] = dfFactMetrics.apply(lambda x: (x['in_fact_perc'] - x['out_fact_perc'])/x['out_fact_perc'], axis=1)
         dfFactMetrics['total_subjects'] = total_subjects
         dfFactMetrics['in_subject_perc'] = dfFactMetrics.apply(lambda x: x['in_subjects'] / x['total_subjects'], axis=1)        
         
         return dfFactMetrics
  
-    def describe_contrast(self, dfContrast):
+    def describe_contrast(self, dfContrast, min_subjects=10, min_perc=.05):
         
         # display intreseting stats about the subset/cluster
         
-        print('set contains', dfContrast[0]['in_subjects'], 'subjects')
+        print('set contains', dfContrast['in_subjects'][0], 'of', dfContrast['total_subjects'][0],\
+              'subjects', dfContrast['in_subject_perc'][0]*100, '%')
+
+        if len(self.factset.fact_alias_data)>0:
+            alias_column = self.factset.fact_alias_column
+            dfContrast = pd.merge(dfContrast, \
+                                  self.factset.fact_alias_data[['fact_name','fact_value',alias_column]], on=['fact_name','fact_value'])
+            dfContrast['fact_value'] = dfContrast[alias_column]
+            
+        disp_cols = ['fact_name', 'fact_value', 'in_fact_subjects', 'in_fact_perc', 'out_fact_perc','perc_diff', 'subject_diff']
+
+        dictFormats = {'in_fact_perc':'{:.2%}'.format, 'out_fact_perc':'{:.2%}'.format, 'perc_diff':'{:.2%}'.format}
+        dfContrastHighFilter = dfContrast[(dfContrast['in_fact_subjects']>=min_subjects) & (dfContrast['in_fact_perc']>=min_perc)][disp_cols]
+        dfContrastLowFilter = dfContrast[(dfContrast['out_fact_subjects']>=min_subjects) & (dfContrast['out_fact_perc']>=min_perc)][disp_cols]
+
+        print('\nhigh concentration')
+        display(HTML(dfContrastHighFilter.sort_values(by='subject_diff', ascending=False)[0:10].to_html(index=False, formatters=dictFormats)))
+        print('\nlow concentration')
+        display(HTML(dfContrastLowFilter.sort_values(by='subject_diff', ascending=True)[0:10].to_html(index=False, formatters=dictFormats)))
+
     
     def plot_clusters(self, cluster_count, generate_for='subject', max_points=500, cluster_name=''):
         
@@ -257,4 +292,5 @@ class Fathom:
 
         plt.show()        
         
+               
                
